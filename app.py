@@ -9,9 +9,9 @@ import stripe  # ← 追加
 stripe.api_key = st.secrets["stripe"]["secret_key"]  # ← 追加
 # --- Page Config ---
 st.set_page_config(
-    page_title="CRAIN | AI Video Creation Suite", 
+    page_title="CRAIN | AI Video Script Generator",
     page_icon="crain_icon.png", 
-    layout="centered"
+    layout="wide"
 )
 
 # 画像をBase64形式に変換してHTMLに埋め込むためのヘルパー関数

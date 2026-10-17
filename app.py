@@ -4,9 +4,16 @@ from openai import OpenAI
 from supabase import create_client, Client
 import random
 import base64
+from CRAIN_stripe import (
+    create_checkout_session,
+    get_or_create_stripe_customer,
+    create_billing_portal_session,
+)
 
 import stripe  # ← 追加
 stripe.api_key = st.secrets["stripe"]["secret_key"]  # ← 追加
+# 公開時は secrets.toml の [app] base_url に HTTPS 公開URLを設定する
+APP_BASE_URL = st.secrets.get("app", {}).get("base_url", "http://localhost:8501").rstrip("/")
 # --- Page Config ---
 st.set_page_config(
     page_title="CRAIN | AI Video Script Generator",
@@ -140,13 +147,89 @@ if "script_refine_left" not in st.session_state:
     st.session_state.script_refine_left = 0
 if "idea_refine_left" not in st.session_state:
     st.session_state.idea_refine_left = 0
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
+def today_jst():
+    return datetime.now(
+        ZoneInfo("Asia/Tokyo")
+    ).date().isoformat()
+
+
+def usage_today():
+    user = st.session_state.get("user")
+
+    if user is None:
+        return 0
+
+    result = (
+        supabase.table("daily_usage")
+        .select("generation_count")
+        .eq("user_id", str(user.id))
+        .eq("usage_date", today_jst())
+        .limit(1)
+        .execute()
+    )
+
+    return (
+        int(result.data[0]["generation_count"])
+        if result.data
+        else 0
+    )
+
+def reserve_generation():
+    result = supabase.rpc(
+        "crain_reserve_generation",
+        {}
+    ).execute()
+
+    return result.data is True
 try:
-    session_res = supabase.auth.get_session()
-    if session_res and session_res.session:
-        st.session_state.user = session_res.session.user
-except Exception:
-    pass
+    auth_session = st.session_state.get("auth_session")
+
+    if auth_session is not None:
+        supabase.auth.set_session(
+            auth_session.access_token,
+            auth_session.refresh_token
+        )
+
+        current_user = supabase.auth.get_user()
+        st.session_state.user = current_user.user
+        st.write(
+            "認証チェック:",
+            "成功" if supabase.auth.get_session() else "失敗"
+        )
+except Exception as e:
+    st.session_state.user = None
+    st.session_state.is_premium = False
+    st.error(f"認証セッションの復元に失敗しました: {e}")
+# ログインユーザーの契約状態を取得
+st.session_state.is_premium = False
+
+user = st.session_state.get("user")
+
+if user is not None:
+    try:
+        result = (
+            supabase.table("subscriptions")
+            .select("plan, status")
+            .eq("user_id", str(user.id))
+            .limit(1)
+            .execute()
+        )
+
+        if result.data:
+            subscription = result.data[0]
+
+            st.session_state.is_premium = (
+                subscription["plan"] == "premium"
+                and subscription["status"] in ["active", "trialing"]
+            )
+        else:
+            st.session_state.is_premium = False
+    except Exception as e:
+        st.session_state.is_premium = False
+        st.error(f"契約情報の取得に失敗しました: {e}")
 
 TEXTS = {
     "日本語": {
@@ -245,6 +328,13 @@ if st.session_state.user is None:
                     try:
                         res = supabase.auth.sign_in_with_password({"email": email, "password": password})
                         st.session_state.user = res.user
+                        st.session_state.auth_session = res.session
+                        
+                        supabase.auth.set_session(
+                            res.session.access_token,
+                            res.session.refresh_token
+                        )
+
                         st.rerun()
                     except Exception:
                         st.error("認証失敗: メールアドレスまたはパスワードが正しくありません。")
@@ -300,16 +390,32 @@ else:
         """, unsafe_allow_html=True)
         st.caption("Next-Generation Video Script Architecture")
 
-    with col_status:
-        is_prem = st.session_state.get("is_premium", False)
-        if is_prem:
-            left_prem = st.session_state.premium_generation_left
-            st.markdown(f"<div style='text-align:right; color:#c4b5fd; font-size:0.85rem;'>PLAN: PREMIUM<br>Quota: {left_prem} / 30</div>", unsafe_allow_html=True)
-        else:
-            left_count = st.session_state.free_generation_left
-            st.markdown(f"<div style='text-align:right; color:#94a3b8; font-size:0.85rem;'>PLAN: STANDARD<br>Quota: {left_count} / 2</div>", unsafe_allow_html=True)
+        with col_status:
+            is_prem = st.session_state.get("is_premium", False)
 
-    st.markdown("---")
+            try:
+                used_today = usage_today()
+            except Exception:
+                used_today = None
+                st.warning("利用回数を取得できませんでした。")
+
+        daily_limit = 30 if is_prem else 2
+        remaining = max(0, daily_limit - used_today) if used_today is not None else "確認不可"
+
+        if is_prem:
+            st.markdown(
+                f"<div style='text-align:right; color:#a855f7;'>"
+                f"💎 PREMIUM｜残り {remaining} / {daily_limit} 回"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                f"<div style='text-align:right; color:#94a3b8;'>"
+                f"FREE｜残り {remaining} / {daily_limit} 回"
+                f"</div>",
+                unsafe_allow_html=True
+            )
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         t["tab_script"], t["tab_idea"], t["tab_archive"], t["tab_saved"], t["tab_upgrade"], t["tab_support"]
@@ -340,29 +446,39 @@ else:
         if is_prem:
             use_trend_ai = st.checkbox("CRAIN Trend & Algorithm Optimization Module", value=True, key="script_trend")
 
-        if st.button(t["btn_generate"], key="generate_script_btn", use_container_width=True):
-            can_generate = False
-            if is_prem:
-                if st.session_state.premium_generation_left > 0:
-                    can_generate = True
-                else:
-                    st.error("本日の生成上限（30回）に達しました。")
-            else:
-                if st.session_state.free_generation_left > 0:
-                    can_generate = True
-                else:
-                    st.error("本日の無料生成上限（2回）に達しました。CRAIN プレミアムプランへアップグレードしてください。")
-
+        if st.button(t["btn_generate"], key="generate_script_btn"):
+            can_generate = True
+            
             if can_generate:
                 if not topic:
                     st.warning("メインテーマを入力してください。")
                 elif not client:
                     st.error("OpenAI APIキーの認識に失敗しました。")
                 else:
+                    try:
+                        allowed = reserve_generation()
+                    except Exception as e:
+                        allowed = False
+                        st.error(f"生成回数の確認に失敗しました: {e}")
+                    
+                    if not allowed:
+                        st.warning(
+                          "🔒 現在、台本を生成できません。\n\n"
+                            "本日の無料生成回数を使い切った可能性があります。\n\n"
+                            "生成回数が残っている場合は、再ログインをお試しください。"
+                         )
+                        if not is_prem:
+                            st.info(
+                                "💎 CRAIN PREMIUMなら、"
+                                "無料プランより多くの台本を生成できます。"
+                            )
+                            st.caption("画面上部の「プレミアム」タブからプランを確認できます。")
+                        st.stop()
+                    
                     with st.spinner("CRAIN Neural Processing..."):
-                        trend_instruction = ""
-                        if use_trend_ai:
-                            trend_instruction = """
+                            trend_instruction = ""
+                            if use_trend_ai:
+                                trend_instruction = """
                             【CRAIN トレンド・アルゴリズム解析モジュール】
                             台本冒頭に以下の分析セクションを挿入してください:
                             ■ CRAIN ALGORITHM & TREND ANALYSIS
@@ -370,55 +486,50 @@ else:
                             - 視聴維持率最適化ロジック:
                             """
 
-                        prompt = f"""
-                        あなたは最高峰の映像脚本家およびマーケティングプロデューサーです。
-                        以下の条件に従い、洗練された動画台本を作成してください。
+                            prompt = f"""
+                            あなたは最高峰の映像脚本家およびマーケティングプロデューサーです。
+                            以下の条件に従い、洗練された動画台本を作成してください。
 
-                        {trend_instruction}
+                            {trend_instruction}
 
-                        【仕様】
-                        - プラットフォーム: {platform}
-                        - 時間定義: {target_duration_selection}
-                        - ジャンル: {genre}
-                        - ペルソナ: {target_audience}
-                        - トーン: {speaking_style}
-                        - テーマ: {topic}
-                        - 指示: {extra_instructions}
-                        
-                        【構成】
-                        1. Hook（最初の3秒の惹きつけ）
-                        2. Body（テンポの良い本編解説、映像指示・テロップ指示を含む）
-                        3. Call to Action（効果的な結び）
-                        """
+                            【仕様】
+                            - プラットフォーム: {platform}
+                            - 時間定義: {target_duration_selection}
+                            - ジャンル: {genre}
+                            - ペルソナ: {target_audience}
+                            - トーン: {speaking_style}
+                            - テーマ: {topic}
+                            - 指示: {extra_instructions}
+                            
+                            【構成】
+                            1. Hook（最初の3秒の惹きつけ）
+                            2. Body（テンポの良い本編解説、映像指示・テロップ指示を含む）
+                            3. Call to Action（効果的な結び）
+                            """
 
-                        try:
-                            response = client.chat.completions.create(
+                            try:
+                                response = client.chat.completions.create(
                                 model="gpt-4o-mini",
                                 messages=[{"role": "user", "content": prompt}],
                                 temperature=0.7,
-                            )
-                            generated_script = response.choices[0].message.content
+                                )
+                                generated_script = response.choices[0].message.content
                             
-                            st.session_state.last_generated_script = generated_script
-                            st.session_state.last_topic_info = f"[{platform} / {target_duration_selection}] {topic}"
-                            
-                            st.session_state.script_refine_left = 3 if is_prem else 1
+                                st.session_state.last_generated_script = generated_script
+                                st.session_state.last_topic_info = f"[{platform} / {target_duration_selection}] {topic}"
+                                
+                                st.session_state.script_refine_left = 3 if is_prem else 1
 
-                            if is_prem:
-                                st.session_state.premium_generation_left -= 1
-                            else:
-                                st.session_state.free_generation_left -= 1
+                                data = {
+                                    "user_id": st.session_state.user.id,
+                                    "topic": st.session_state.last_topic_info,
+                                    "script": generated_script
+                                }
+                                supabase.table("generation_history").insert(data).execute()
+                                st.rerun()
 
-                            data = {
-                                "user_id": st.session_state.user.id,
-                                "topic": st.session_state.last_topic_info,
-                                "script": generated_script
-                            }
-                            supabase.table("generation_history").insert(data).execute()
-                            st.rerun()
-
-                        except Exception as e:
-                            st.error(f"システムエラーが発生しました: {e}")
+                            except Exception as e:
+                                st.error(f"システムエラーが発生しました: {e}")
 
         # 出力結果
         if "last_generated_script" in st.session_state and st.session_state.last_generated_script:
@@ -508,23 +619,19 @@ else:
         ]
 
         if st.button(t["btn_ideas"], key="generate_ideas_btn", use_container_width=True):
-            can_gen_idea = False
-            if is_prem:
-                if st.session_state.premium_generation_left > 0:
-                    can_gen_idea = True
-                else:
-                    st.error("本日の生成上限に達しました。")
+            if not idea_genre.strip():
+                st.warning("ジャンルを入力してください。")
+            elif not client:
+                st.error("OpenAI APIキーの認識に失敗しました。")
             else:
-                if st.session_state.free_generation_left > 0:
-                    can_gen_idea = True
-                else:
-                    st.error("本日の無料生成上限に達しました。")
+                try:
+                    allowed = reserve_generation()
+                except Exception as e:
+                    allowed = False
+                    st.error(f"生成回数の確認に失敗しました: {e}")
 
-            if can_gen_idea:
-                if not idea_genre:
-                    st.warning("ジャンルを入力してください。")
-                elif not client:
-                    st.error("OpenAI APIキーの認識に失敗しました。")
+                if not allowed:
+                    st.warning("本日の生成上限に達したか、利用枠を確認できませんでした。")
                 else:
                     with st.spinner("CRAIN Analyzing Market Vectors..."):
                         selected_templates = random.sample(template_pool, min(7, len(template_pool)))
@@ -558,11 +665,6 @@ else:
                             
                             st.session_state.idea_refine_left = 3 if is_prem else 1
 
-                            if is_prem:
-                                st.session_state.premium_generation_left -= 1
-                            else:
-                                st.session_state.free_generation_left -= 1
-                            
                             st.rerun()
                         except Exception as e:
                             st.error(f"エラーが発生しました: {e}")
@@ -571,7 +673,7 @@ else:
             st.markdown("---")
             st.text_area("Ideas Output", value=st.session_state.last_generated_ideas, height=350, key="current_ideas_display")
 
-            if st.button("BOOKMARK TO CRAIN LIBRARY"):
+            if st.button("BOOKMARK TO CRAIN LIBRARY", key="bookmark_script"):
                 try:
                     fav_data = {
                         "user_id": st.session_state.user.id,
@@ -637,11 +739,12 @@ else:
         except Exception:
             st.info("データの取得に失敗しました。")
 
-    # ---------------------------------------------------------
+        # ---------------------------------------------------------
     # TAB 5: プレミアムプラン
     # ---------------------------------------------------------
     with tab5:
         st.markdown("##### CRAIN PREMIUM SUITE")
+
         st.write("""
         プロダクションレベルの動画制作スピードと、高精度な市場適合を解禁します。
 
@@ -649,27 +752,131 @@ else:
         - **Advanced Refinement Engine** (最大3回までの精密修正)
         - **Algorithm & Trend Real-time Analysis**
         """)
-        
+
         st.markdown("---")
+
+                # Supabaseから最新の契約状態を取得
+        user = st.session_state.get("user")
+        
         if st.session_state.get("is_premium", False):
             st.success("PREMIUM PLAN ACTIVE")
+            user = st.session_state.get("user")
+
+            if user is not None:
+                if st.button("契約内容の確認・解約", use_container_width=True):
+                    try:
+                        customer_id = get_or_create_stripe_customer(
+                            supabase,
+                            str(user.id),
+                            user.email,
+                        )
+
+                        portal_url = create_billing_portal_session(
+                            customer_id,
+                            f"{APP_BASE_URL}/",
+                        )
+
+                        st.link_button(
+                            "Stripeの契約管理ページを開く",
+                            portal_url,
+                            use_container_width=True,
+                        )
+
+                    except Exception as e:
+                        st.exception(e)
+                    
         else:
             col_m, col_y = st.columns(2)
-            
+
+            # 月額プラン
             with col_m:
                 st.markdown(f"### {t['monthly']}")
-                st.markdown("**¥1,980 / 月**")  # 980円から1,980円に統一
+                st.markdown("**¥1,980 / 月**")
                 st.caption("月額自動更新")
-                monthly_link = "https://buy.stripe.com/9B67sM1if5QWfeobV07g401" # ← 新しい月額本番リンクを設定
-                st.link_button("月額プランを選択", monthly_link, type="primary")
 
+                if st.button(
+                    "月額プランを選択",
+                    type="primary",
+                    use_container_width=True
+                ):
+                    user = st.session_state.get("user")
+
+                    if user is None:
+                        st.warning("購入するにはログインが必要です。")
+
+                    else:
+                        try:
+                            customer_id = get_or_create_stripe_customer(
+                                supabase,
+                                str(user.id),
+                                user.email,
+                            )
+
+                            checkout_url = create_checkout_session(
+                                customer_id=customer_id,
+                                user_id=str(user.id),
+                                price_id=st.secrets["stripe"]["monthly_price_id"],
+                                success_url=f"{APP_BASE_URL}/?payment=success",
+                                cancel_url=f"{APP_BASE_URL}/?payment=cancel",
+                            )
+
+                            st.success("決済ページの準備ができました！")
+
+                            st.link_button(
+                                "Stripeの決済画面へ進む",
+                                checkout_url,
+                                type="primary",
+                                use_container_width=True,
+                            )
+
+                        except Exception:
+                            import traceback
+                            traceback.print_exc()
+                            st.error("決済ページの作成に失敗しました。")
+
+            # 年額プラン
             with col_y:
-                st.markdown(f"### {t['annual']}")
+                st.markdown("### 年額プラン")
                 st.markdown("**¥19,800 / 年**")
-                st.caption("2ヶ月分アドバンテージ (実質1,650/月) ")
-                yearly_link = "https://buy.stripe.com/cNibJ28KHcfk3vGf7c7g400"  # ← 先ほど作成した年額本番リンクを設定
-                st.link_button("年額プランを選択", yearly_link, type="primary")
+                st.caption("月額換算 ¥1,650・年間3,960円お得")
 
+                if st.button(
+                    "年額プランを選択",
+                    key="yearly_checkout",
+                    use_container_width=True,
+                ):
+                    user = st.session_state.get("user")
+
+                    if user is None:
+                        st.warning("購入するにはログインが必要です。")
+                    else:
+                        try:
+                            customer_id = get_or_create_stripe_customer(
+                                supabase,
+                                str(user.id),
+                                user.email,
+                            )
+
+                            checkout_url = create_checkout_session(
+                                customer_id=customer_id,
+                                user_id=str(user.id),
+                                price_id=st.secrets["stripe"]["yearly_price_id"],
+                                success_url=f"{APP_BASE_URL}/?payment=success",
+                                cancel_url=f"{APP_BASE_URL}/?payment=cancel",
+                            )
+
+                            st.success("年間プランの決済ページを準備しました！")
+                            st.link_button(
+                                "Stripeの決済画面へ進む",
+                                checkout_url,
+                                type="primary",
+                                use_container_width=True,
+                            )
+
+                        except Exception:
+                            import traceback
+                            traceback.print_exc()
+                            st.error("年間プランの決済ページ作成に失敗しました。")
     # ---------------------------------------------------------
     # TAB 6: サポート & フィードバック
     # ---------------------------------------------------------
@@ -705,12 +912,3 @@ else:
                     st.success("フィードバックを正常に送信しました。")
                 except Exception as e:
                     st.error(f"送信失敗: {e}")
-# --- Stripe 決済ボタンの修正版コード ---
-
-st.markdown("---")
-st.subheader("💎 CRAIN プレミアムプラン（月額プラン）")
-st.write("プロフェッショナルな動画台本生成を無制限に利用できる有料プランです。")
-
-# 決済ボタン（クリックするとプレミアムプランのタブに移動します）
-if st.button("プレミアムプランに申し込む", type="primary"):
-    st.info("💡 上部のタブメニューから「プレミアムプラン」を選択し、月額または年額プランをお選びください。")

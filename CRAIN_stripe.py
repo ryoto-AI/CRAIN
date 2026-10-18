@@ -76,7 +76,12 @@ def get_or_create_stripe_customer(supabase, user_id, email):
         customer_id = result.data[0].get(customer_column)
 
         if customer_id:
-            return customer_id
+            try:
+                stripe.Customer.retrieve(customer_id)
+                return customer_id
+            except stripe.error.InvalidRequestError as e:
+                if e.code != "resource_missing":
+                    raise
 
     customer = stripe.Customer.create(
         email=email,

@@ -212,7 +212,7 @@ if user is not None:
     try:
         result = (
             supabase.table("subscriptions")
-            .select("plan, status")
+            .select("plan, status, stripe_live_plan, stripe_live_status")
             .eq("user_id", str(user.id))
             .limit(1)
             .execute()
@@ -221,9 +221,18 @@ if user is not None:
         if result.data:
             subscription = result.data[0]
 
+            stripe_mode = st.secrets["stripe"].get("mode", "test")
+
+            if stripe_mode == "live":
+                plan = subscription.get("stripe_live_plan")
+                status = subscription.get("stripe_live_status")
+            else:
+                plan = subscription.get("plan")
+                status = subscription.get("status")
+
             st.session_state.is_premium = (
-                subscription["plan"] == "premium"
-                and subscription["status"] in ["active", "trialing"]
+                plan == "premium"
+                and status in ["active", "trialing"]
             )
         else:
             st.session_state.is_premium = False

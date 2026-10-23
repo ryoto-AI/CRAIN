@@ -1,17 +1,27 @@
+from CRAIN_ai_config import get_ai_model
+from CRAIN_ai_config import get_ai_provider
+from CRAIN_gemini import generate_with_gemini
+from CRAIN_premium_engine_v23 import generate_premium_five_minute
 import os
 import streamlit as st
 from openai import OpenAI
 from supabase import create_client, Client
 import random
 import base64
+# PRODUCTION CANDIDATE: Restore the original Stripe integration unchanged.
 from CRAIN_stripe import (
     create_checkout_session,
     get_or_create_stripe_customer,
     create_billing_portal_session,
 )
+import stripe
 
-import stripe  # ← 追加
-stripe.api_key = st.secrets["stripe"]["secret_key"]  # ← 追加
+# The production quota RPC reads stripe_live_* columns exclusively.
+# Fail closed if the app is accidentally started in Stripe test mode.
+if st.secrets["stripe"].get("mode") != "live":
+    st.error("本番候補はStripe LIVEモード専用です。公開設定を確認してください。")
+    st.stop()
+
 # 公開時は secrets.toml の [app] base_url に HTTPS 公開URLを設定する
 APP_BASE_URL = st.secrets.get("app", {}).get("base_url", "http://localhost:8501").rstrip("/")
 # --- Page Config ---
@@ -120,9 +130,16 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # --- Initialize Supabase & OpenAI ---
+# Production Supabase connection. No staging keys are used.
 SUPABASE_URL = st.secrets["supabase"]["url"]
 SUPABASE_KEY = st.secrets["supabase"]["key"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+_service_key = st.secrets["supabase"]["service_role_key"]
+if not _service_key:
+    st.error("Supabase管理者キーが設定されていません。")
+    st.stop()
+admin_supabase = create_client(SUPABASE_URL, _service_key)
 
 openai_api_key = st.secrets.get("openai", {}).get("api_key", "")
 client = OpenAI(api_key=openai_api_key) if openai_api_key else None
@@ -178,12 +195,37 @@ def usage_today():
     )
 
 def reserve_generation():
-    result = supabase.rpc(
-        "crain_reserve_generation",
-        {}
-    ).execute()
+    """Returns a UUID reservation id or None, never a boolean."""
+    return supabase.rpc("crain_reserve_generation_v2", {}).execute().data
 
-    return result.data is True
+
+def _finalize(reservation_id, action):
+    if admin_supabase is None:
+        raise RuntimeError("service_role_key が未設定です")
+    method = {"confirm": "crain_confirm_generation_v2", "refund": "crain_refund_generation_v2"}[action]
+    return admin_supabase.rpc(method, {"p_reservation_id": str(reservation_id)}).execute().data
+
+
+def refund_failed_generation(reservation_id):
+    """Refund only when model generation failed before delivering content."""
+    try:
+        if _finalize(reservation_id, "refund") is True:
+            st.warning("生成エラーのため利用回数を返還しました。")
+        else:
+            st.error("利用回数の返還状態が不明です。サポートへ連絡してください。")
+    except Exception:
+        st.error("返還処理に失敗しました。予約状態の確認が必要です。")
+
+
+def confirm_completed_generation(reservation_id):
+    """Confirm a delivered result. NEVER auto-refund if confirmation fails."""
+    try:
+        if _finalize(reservation_id, "confirm") is True:
+            return True
+    except Exception:
+        pass
+    st.error("結果は保持しましたが利用枠の確定を確認できません。返還せず管理者による確認が必要です。")
+    return False
 try:
     auth_session = st.session_state.get("auth_session")
 
@@ -553,7 +595,7 @@ else:
                     st.error("OpenAI APIキーの認識に失敗しました。")
                 else:
                     try:
-                        allowed = reserve_generation()
+                        allowed = reserve_generation() if admin_supabase is not None else None
                     except Exception as e:
                         allowed = False
                         st.error(f"生成回数の確認に失敗しました: {e}")
@@ -582,51 +624,213 @@ else:
                             - トレンド合致ポイント:
                             - 視聴維持率最適化ロジック:
                             """
+                    # CRAIN Creative Direction Engine
+                            creative_direction = """
+                            【CRAIN クリエイティブ設計エンジン】
 
-                            prompt = f"""
-                            あなたは最高峰の映像脚本家およびマーケティングプロデューサーです。
-                            以下の条件に従い、洗練された動画台本を作成してください。
+                            台本を書く前に、以下の工程を内部で検討してください。
 
-                            {trend_instruction}
+                            STEP 1：テーマ分析・情報深掘り設計
+                            ・視聴者が最も知りたい核心的な疑問を1つ特定する。
+                            ・その疑問に答えるために必要な情報を3〜5個選ぶ。
+                            ・情報はジャンルに応じて、仕組み、原因、背景、実例、
+                            比較、対立する説、具体的な使用場面などから選択する。
+                            ・各情報について「何が起きるか」だけでなく、
+                            「なぜ起きるか」「どのように起きるか」まで掘り下げる。
+                            ・一般論の繰り返しではなく、視聴者が新しく知る内容を優先する。
+                            ・ただし、情報を増やすために事実やデータを創作しない。
+                            ・十分な根拠がない場合は断定せず、不確実性を明示する。
+                            ・選んだ情報を、視聴者が理解しやすい順序に整理する。
 
-                            【仕様】
-                            - プラットフォーム: {platform}
-                            - 時間定義: {target_duration_selection}
-                            - ジャンル: {genre}
-                            - ペルソナ: {target_audience}
-                            - トーン: {speaking_style}
-                            - テーマ: {topic}
-                            - 指示: {extra_instructions}
-                            
-                            【構成】
-                            1. Hook（最初の3秒の惹きつけ）
-                            2. Body（テンポの良い本編解説、映像指示・テロップ指示を含む）
-                            3. Call to Action（効果的な結び）
+                            STEP 2：構成設計
+                            ・テーマに適した異なる構成案を検討する。
+                            ・最も視聴者を引きつける構成を採用する。
+                            ・ジャンルに応じて展開を変化させる。
+                            ・冒頭で提示した疑問を本編で深掘りする。
+
+                            STEP 3：脚本制作
+                            ・抽象的な説明より具体的な事実や事例を優先する。
+                            ・同じ内容を繰り返さない。
+                            ・不自然な比喩やAI特有の決まり文句を避ける。
+                            ・各段落に新しい情報や展開を含める。
+
+                            STEP 4：品質確認
+                            ・冒頭に視聴する理由があるか。
+                            ・内容が薄くなっていないか。
+                            ・ジャンルに合った表現になっているか。
+                            ・文章が自然につながっているか。
+                            ・結末が冒頭の疑問に対応しているか。
+
+                            内部の検討過程は出力せず、完成した台本のみを出力してください。
                             """
 
+                            prompt = f"""
+                            {creative_direction}
+
+                            あなたは世界トップクラスの映像脚本家、SNSマーケター、
+                            ドキュメンタリー構成作家を兼ねるプロフェッショナルです。
+
+                            あなたの目的は、単なる情報提供ではありません。
+                            視聴者が思わず続きを見たくなる、独自性の高い動画台本を制作することです。
+
+                            【基本情報】
+                            プラットフォーム：{platform}
+                            動画時間：{target_duration_selection}
+                            ジャンル：{genre}
+                            ターゲット：{target_audience}
+                            話し方：{speaking_style}
+                            テーマ：{topic}
+                            追加指示：{extra_instructions}
+
+                            【最重要ルール】
+
+                            1. ジャンルに応じて動画構成を最適化してください。
+                            すべての動画を同じ構成にしてはいけません。
+
+                            2. 冒頭3秒で視聴者の好奇心を刺激してください。
+                            ありきたりな挨拶や説明から始めないでください。
+
+                            3. AI特有の不自然な表現を避けてください。
+                            人間のプロ脚本家が執筆したような自然な文章にしてください。
+
+                            4. 視聴者が続きを見たくなるように、
+                            疑問、伏線、意外性、具体例を適切に使用してください。
+
+                            5. 抽象的な説明だけで終わらせず、
+                            具体的なエピソードや実例を取り入れてください。
+
+                            6. 動画時間に適した十分な文章量を確保してください。
+                            ナレーションは1分あたり250〜350文字を目安とします。
+                            ただし、話し方や映像演出によって調整してください。
+
+                            7. ジャンルごとに適切な表現方法を選択してください。
+
+                            ・都市伝説：謎、証拠、矛盾、考察
+                            ・科学：疑問、研究、実験、発見
+                            ・自己啓発：共感、具体例、気づき、行動
+                            ・ファッション：世界観、特徴、着用イメージ
+                            ・商品紹介：課題、魅力、使用場面、購入判断
+                            ・エンタメ：意外性、展開、感情の変化
+
+                            上記は参考例です。
+                            必ずしも固定された順番で使用する必要はありません。
+
+                            8. 事実、仮説、噂を明確に区別してください。
+                            存在しない研究やデータを創作してはいけません。
+
+                            9. 最後まで視聴する価値を作ってください。
+                            単に「フォローしてください」で終わらせず、
+                            動画のテーマに合った印象的な結末を設計してください。
+
+                            10. ユーザーの追加指示を最大限尊重してください。
+
+                            【トレンド分析】
+                            {trend_instruction}
+
+                            【出力形式】
+
+                            ■ 動画タイトル
+
+                            ■ 企画コンセプト
+
+                            ■ 冒頭のフック
+
+                            ■ 本編台本
+                            ナレーション、映像指示、テロップ指示を明確に区別してください。
+
+                            ■ 結末
+
+                            ■ 編集・演出のポイント
+
+                            ■ CRAIN ALGORITHM & TREND ANALYSIS
+                            トレンドに関する分析が可能な場合のみ記載してください。
+                            実際に確認していない最新データを、確認済みの情報として扱わないでください。
+
+                            【品質基準】
+                            【ナレーションの長さ・時間厳守】
+                            ・動画の指定時間に対して、ナレーション本文だけで十分な文字数を確保してください。
+                            ・標準的な読み上げ速度は1分あたり300〜350文字を目安とします。
+                            ・5分動画ならナレーション本文だけで1500〜1750文字を目標にしてください。
+                            ・ナレーション以外のタイトル、テロップ、映像指示、分析文章は文字数に含めないでください。
+                            ・各章のナレーション量は、その章に割り当てた時間に比例させてください。
+                            ・内容を水増しするための繰り返しや、意味のない説明は避けてください。
+                            ・指定時間に必要な情報量が不足する場合は、具体例、背景、比較、研究内容などを追加してください。ただし、未確認の事実を創作してはいけません。
+                            【情報の信頼性・事実と仮説の区別】
+                            ・歴史、科学、医学、事件など、事実の正確性が重要なジャンルでは、情報を「確認された事実」「仮説・噂」「演出・比喩」に区別してください。
+                            ・事実として断定するのは、信頼できる根拠がある情報だけにしてください。
+                            ・情報の出典を実際に確認できていない場合は、確認済みであるかのように表現しないでください。
+                            ・研究者名、年代、数値、論文、研究結果、発言、引用を創作しないでください。
+                            ・仮説や噂は積極的に紹介して構いません。ただし「〜という説があります」「〜と考える研究者もいます」など、未確定であることを明示してください。
+                            ・科学的な測定結果と、その結果から推測される結論を混同しないでください。
+                            ・一部の特徴が一致することを、仮説全体が証明された根拠として扱わないでください。
+                            ・「完全に証明された」「絶対に不可能」「すべての研究者が認めた」などの強い断定は、十分な根拠がない限り避けてください。
+                            ・比喩、擬人化、映画的な演出は積極的に使用してください。ただし、演出を歴史的事実として誤認させないでください。
+                            ・未確認の情報を削除するだけでなく、確認できる事実、複数の仮説、未解決の論点を組み合わせ、面白さと情報量を維持してください。
+                            ・外部資料を調査していない場合、調査済み・検証済み・最新データに基づく分析であると主張しないでください。
+                            【強調テロップの生成ルール】
+                            ・テロップはナレーション全文の字幕ではなく、視聴者に強く印象づけたい言葉を表示するためのものです。
+                            ・ナレーションの各場面に対応する強調テロップを提案してください。
+                            ・単なる章タイトルや内容の要約ではなく、視聴者の感情や好奇心を刺激する表現にしてください。
+                            ・重要な数字、意外な事実、対立する仮説、印象的なセリフなどを優先してください。
+                            ・原則として1つのテロップは5〜20文字程度とし、瞬時に読める長さにしてください。
+                            ・各テロップには、表示するタイミングと対応するナレーションを明示してください。
+                            ・重要な場面では、文字の大きさ、色、表示アニメーションなどの演出も提案してください。
+                            ・事実と仮説を区別し、未確認の情報を断定的なテロップにしないでください。
+                            ・すべての場面に無理やりテロップを入れる必要はありません。強調する価値がある場面を選んでください。
+                            ・自然で独自性の高い表現
+                            ・ジャンルに適した構成
+                            【内容の具体性・情報密度】
+                            ・抽象的な説明だけで終わらせず、視聴者が新しい知識や発見を得られる具体的な内容を盛り込んでください。
+                            ・人物、出来事、背景、仕組み、研究方法、比較、具体例などから、テーマに適した情報を選んで深掘りしてください。
+                            ・単に「研究された」「注目されている」と説明するのではなく、何を、どのように、なぜ調べたのかまで説明してください。
+                            ・専門用語は原則として自然な説明を添え、初めて聞く視聴者にも理解できるようにしてください。
+                            ・ただし、ユーザーが自由指示欄などで専門性や表現方法を指定した場合は、その指示を優先してください。
+                            ・事実だけでなく、考察、仮説、独自の視点も積極的に取り入れ、知的好奇心を刺激してください。
+                            ・具体性を高めるために、存在しない人物、研究、数値、発言、証拠を創作しないでください。
+                            ・視聴維持を意識した展開
+                            ・視聴者に価値を提供する内容
+
+                            以上の条件に従い、完成度の高い動画台本を作成してください。
+                            """
+
+                            reservation_id = allowed
                             try:
-                                response = client.chat.completions.create(
-                                model="gpt-4o-mini",
-                                messages=[{"role": "user", "content": prompt}],
-                                temperature=0.7,
-                                )
-                                generated_script = response.choices[0].message.content
-                            
+                                if is_prem and target_duration_selection.startswith("5分"):
+                                    fields = dict(platform=platform, genre=genre, topic=topic,
+                                        target_audience=target_audience,
+                                        speaking_style=speaking_style,
+                                        extra_instructions=extra_instructions)
+                                    generated_script = generate_premium_five_minute(
+                                        openai_api_key,
+                                        get_ai_model(plan="premium"), fields)
+                                elif get_ai_provider("premium" if is_prem else "free") == "gemini":
+                                    generated_script = generate_with_gemini(prompt)
+                                else:
+                                    response = client.chat.completions.create(
+                                        model=get_ai_model(plan="premium" if is_prem else "free"),
+                                        messages=[{"role": "user", "content": prompt}],
+                                        temperature=0.7, max_completion_tokens=8000)
+                                    generated_script = response.choices[0].message.content
+                                if not generated_script or not generated_script.strip():
+                                    raise RuntimeError("AIの生成結果が空です")
+                            except Exception as e:
+                                refund_failed_generation(reservation_id)
+                                st.error(f"AI生成エラー: {type(e).__name__}")
+                            else:
+                                # Keep successful content regardless of quota confirmation/history errors.
                                 st.session_state.last_generated_script = generated_script
                                 st.session_state.last_topic_info = f"[{platform} / {target_duration_selection}] {topic}"
-                                
                                 st.session_state.script_refine_left = 3 if is_prem else 1
-
-                                data = {
-                                    "user_id": st.session_state.user.id,
-                                    "topic": st.session_state.last_topic_info,
-                                    "script": generated_script
-                                }
-                                supabase.table("generation_history").insert(data).execute()
-                                st.rerun()
-
-                            except Exception as e:
-                                st.error(f"システムエラーが発生しました: {e}")
+                                if confirm_completed_generation(reservation_id):
+                                    try:
+                                        supabase.table("generation_history").insert({
+                                            "user_id": st.session_state.user.id,
+                                            "topic": st.session_state.last_topic_info,
+                                            "script": generated_script}).execute()
+                                    except Exception:
+                                        st.warning("台本は完成しましたが履歴保存に失敗しました。結果は画面に保持しています。")
+                                    else:
+                                        st.rerun()
 
         # 出力結果
         if "last_generated_script" in st.session_state and st.session_state.last_generated_script:
@@ -639,8 +843,35 @@ else:
             est_sec = est_seconds % 60
             st.caption(f"Volume: 約 {char_count}文字 ｜ Estimated Time: 約 {est_min}分 {est_sec}秒")
 
-            st.text_area("Script Output", value=st.session_state.last_generated_script, height=350, key="current_script_display")
+            st.text_area(
+                "Script Output",
+                value=st.session_state.last_generated_script,
+                height=350,
+                key=f"script_display_{hash(st.session_state.last_generated_script)}"
+            )
+            if st.button("💾 編集した台本を保存"):
+                edited_script = st.session_state[
+                    f"script_display_{hash(st.session_state.last_generated_script)}"
+                ]
 
+                if edited_script.strip():
+                    st.session_state.last_generated_script = edited_script
+                    try:
+                        edited_data = {
+                            "user_id": st.session_state.user.id,
+                            "topic": f"{st.session_state.get('last_topic_info', '台本')} (Manually Edited)",
+                            "script": edited_script
+                        }
+
+                        supabase.table("generation_history").insert(edited_data).execute()
+
+                    except Exception as e:
+                        st.error(f"履歴への保存に失敗しました: {e}")
+                    else:
+                        st.success("編集した台本を保存しました！")
+                        st.rerun()
+                else:
+                    st.warning("台本が空になっています。")
             if st.button("BOOKMARK TO CRAIN LIBRARY"):
                 try:
                     fav_data = {
@@ -678,12 +909,18 @@ else:
                         {feedback_script}
                         """
                         try:
-                            res_fix = client.chat.completions.create(
-                                model="gpt-4o-mini",
-                                messages=[{"role": "user", "content": fix_prompt}],
-                                temperature=0.7,
-                            )
-                            fixed_script = res_fix.choices[0].message.content
+                            if get_ai_provider("premium" if is_prem else "free") == "gemini":
+                                fixed_script = generate_with_gemini(fix_prompt)
+                            else:
+                                res_fix = client.chat.completions.create(
+                                    model=get_ai_model(
+                                        plan="premium" if is_prem else "free"
+                                    ),
+                                    messages=[{"role": "user", "content": fix_prompt}],
+                                    temperature=0.7,
+                                )
+                                fixed_script = res_fix.choices[0].message.content
+                            print("【修正結果の冒頭】", repr(fixed_script[:300]))
                             st.session_state.last_generated_script = fixed_script
                             st.session_state.script_refine_left -= 1
 
@@ -722,7 +959,7 @@ else:
                 st.error("OpenAI APIキーの認識に失敗しました。")
             else:
                 try:
-                    allowed = reserve_generation()
+                    allowed = reserve_generation() if admin_supabase is not None else None
                 except Exception as e:
                     allowed = False
                     st.error(f"生成回数の確認に失敗しました: {e}")
@@ -750,21 +987,24 @@ else:
                         - 【コンセプトタイトル】
                         - 【ターゲットフック & ロジック】
                         """
+                        reservation_id = allowed
                         try:
                             response = client.chat.completions.create(
                                 model="gpt-4o-mini",
                                 messages=[{"role": "user", "content": idea_prompt}],
-                                temperature=0.8,
-                            )
+                                temperature=0.8)
                             generated_ideas = response.choices[0].message.content
+                            if not generated_ideas or not generated_ideas.strip():
+                                raise RuntimeError("AIの生成結果が空です")
+                        except Exception as e:
+                            refund_failed_generation(reservation_id)
+                            st.error(f"企画生成エラー: {type(e).__name__}")
+                        else:
                             st.session_state.last_generated_ideas = generated_ideas
                             st.session_state.last_idea_genre = idea_genre
-                            
                             st.session_state.idea_refine_left = 3 if is_prem else 1
-
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"エラーが発生しました: {e}")
+                            if confirm_completed_generation(reservation_id):
+                                st.rerun()
 
         if "last_generated_ideas" in st.session_state and st.session_state.last_generated_ideas:
             st.markdown("---")
@@ -801,6 +1041,10 @@ else:
                     for item in reversed(normal_history):
                         with st.expander(f"{item.get('topic', 'Untitled')}"):
                             st.caption(f"Date: {item.get('created_at', '')}")
+                            if st.button("✏️ この台本を再編集する", key=f"edit_history_{item['id']}"):
+                                st.session_state.last_generated_script = item.get("script", "")
+                                st.session_state.last_topic_info = item.get("topic", "履歴から再編集")
+                                st.rerun()
                             st.markdown(item.get('script', ''))
                 else:
                     st.info("アーカイブはありません。")

@@ -2,3 +2,4 @@ streamlit
 openai
 supabase
 stripe
+google-genai
